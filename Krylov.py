@@ -1,30 +1,54 @@
-
-
 import numpy as np
 import scipy.linalg as la
 from qiskit_nature.second_q.mappers import JordanWignerMapper
 from qiskit_nature.second_q.drivers import PySCFDriver
-from qiskit_nature.second_q.problems import ElectronicStructureProblem
-from qiskit_nature.second_q.hamiltonians import ElectronicEnergy
-from qiskit.quantum_info import SparsePauliOp, Pauli
+from qiskit.quantum_info import Pauli
 from qiskit_nature.second_q.circuit.library import HartreeFock
-from qiskit.primitives import StatevectorEstimator
-from qiskit.circuit import QuantumCircuit, Parameter, CircuitInstruction
-from qiskit.circuit.library import PauliEvolutionGate, CSwapGate, PauliGate
+from qiskit.circuit import QuantumCircuit
+from qiskit.circuit.library import  PauliGate
 from qiskit_algorithms import TimeEvolutionProblem, TrotterQRTE
-from qiskit_nature.second_q.operators import FermionicOp
 from qiskit_nature.units import DistanceUnit
-from qiskit.circuit.measure import Measure
 from qiskit import transpile
+from qiskit.quantum_info import SparsePauliOp
+from qiskit.primitives import StatevectorEstimator
 import pennylane as qml
-from qiskit_aer import AerSimulator
-from qiskit_aer.primitives import Estimator
-
 # --- CONFIGURATION VARIABLES ---
 KRYLOV_DIMENSION = 3
 TAU = 0.1
 TROTT_STEPS = 5
 
+
+def molecule_info(molecule_name, bond_length):
+
+    # get molecule data using pennylane
+    DATASET = qml.data.load("qchem", molname=molecule_name, bondlength=bond_length, basis="STO-3G")[0]
+    COORDS = DATASET.molecule.coordinates
+    SYMBOLS = DATASET.molecule.symbols
+    CHARGE = DATASET.molecule.charge
+
+    # get pennylane data into readable form for pySCFDriver
+    atom_info = ""
+    for i in range(len(SYMBOLS)):
+        atom_info += SYMBOLS[i] + " " + str(COORDS[i][0]) + " " + str(COORDS[i][1]) + " " + str(COORDS[i][2]) + "; "
+
+    atom_info = atom_info[0:-2]
+
+    return atom_info
+
+def ev(result, pub_index: int = 0) -> float:
+    """Extract a single expectation value from either V1 (.values) or V2 (pub_result.data.evs) results."""
+    # Old style (Aer Estimator / V1)
+    if hasattr(result, "values"):
+        return float(np.asarray(result.values[pub_index]).reshape(-1)[0])
+
+    # New style (V2 primitives)
+    try:
+        pub_res = result[pub_index]  # PrimitiveResult is indexable in V2
+    except Exception:
+        pub_res = result.pub_results[pub_index]  # fallback for some versions
+
+    # In V2, expectation values live here
+    return float(np.asarray(pub_res.data.evs).reshape(-1)[0])
 
 def get_krylov_state_circuit(initial_state_circuit, H_op, k, tau, trotter_steps):
     """
@@ -46,56 +70,33 @@ def get_krylov_state_circuit(initial_state_circuit, H_op, k, tau, trotter_steps)
         full_circuit = trotter_strategy.evolve(evolution_problem)
         unitary_circuit = full_circuit.evolved_state.decompose()
 
-    return unitary_circuit.to_gate()
+    return unitary_circuit
 
 
-def haddy_test(num_qubits, circuit_i, circuit_j, pauli_string, ancilla_phase):
+def haddy_test(num_qubits, A_i, A_j, pauli_string):
     """
-    Constructs the Hadamard test circuit to measure <psi_i | pauli_string | psi_j>.
+    Builds the Hadamard-test circuit for Re/Im of <psi_i|P|psi_j>
+    by implementing controlled-(A_i^dagger P A_j).
     """
     N = num_qubits
-    total_qubits = N + 1
-    qc = QuantumCircuit(total_qubits)
+    qc = QuantumCircuit(N + 1)
+    anc = 0
+    targets = list(range(1, N + 1))
 
-    ancilla = 0
-    targets = list(range(1, total_qubits))
-    qubit_list = [ancilla] + targets
+    V = QuantumCircuit(N)
+    V.compose(A_i.inverse(), inplace=True)
 
-
-    # --- 1. Define Controlled Versions of Krylov State Circuits ---
-    U = QuantumCircuit(N)
-    
-    # Apply U_i^dagger on the N target qubits
-    U.append(circuit_i.inverse(), range(N)) 
-
-    # Apply the Pauli observable P_p on the N target qubits
     if pauli_string != Pauli('I' * N):
-        pauli_gate=PauliGate(pauli_string.to_label())
-        U.append(pauli_gate, range(N))
+        V.append(PauliGate(pauli_string.to_label()), range(N))
 
-    # Apply U_j on the N target qubits
-    U.compose(circuit_j, range(N))
-    
-    # Convert the N-qubit circuit U to a controlled instruction CU (N+1 qubits)
-    CU_circuit = U.control(1)
-    CU = CU_circuit.data[0].operation
+    V.compose(A_j, inplace=True)
 
-    # --- 2. Ancilla Initialization (Hadamard and Phase) ---
-    qc.h(ancilla)
-    if ancilla_phase:
-        qc.sdg(ancilla)
-
-    # --- 3. Apply First Controlled Circuit (j circuit) ---
-
-
-    # --- 4. Observable Application (Hamiltonian measurement) ---
-
-    # --- 5. Apply Last Controlled Gate (i dagger circuit) ---
-    qc.append(CU, qubit_list)
-    # --- 6. Final Ancilla Hadamard ---
-    qc.h(ancilla)
+    qc.h(anc)
+    qc.append(V.to_gate().control(1), [anc] + targets)
+    qc.h(anc)
 
     return qc
+
 
 
 def quantum_krylov_diagonalization():
@@ -109,22 +110,10 @@ def quantum_krylov_diagonalization():
     # --- 1. Define the Molecule and Hamiltonian ---
     print(f"--- 1. Setting up Molecule for QKD (M={M}, tau={tau}, steps={trotter_steps}) ---")
     molecule_name = "H2"
-    bond_length = 0.742  # LiH 1.57
-    # get molecule data using pennylane
-    DATASET = qml.data.load("qchem", molname=molecule_name, bondlength=bond_length, basis="STO-3G")[0]
-    COORDS = DATASET.molecule.coordinates
-    SYMBOLS = DATASET.molecule.symbols
-    CHARGE = DATASET.molecule.charge
-
-    # get pennylane data into readable form for pySCFDriver
-    atom_info = ""
-    for i in range(len(SYMBOLS)):
-        atom_info += SYMBOLS[i] + " " + str(COORDS[i][0]) + " " + str(COORDS[i][1]) + " " + str(COORDS[i][2]) + "; "
-
-    atom_info = atom_info[0:-2]
-    # Use PySCFDriver to compute molecular integrals
+    bond_length = 0.742
+    atom_info = molecule_info(molecule_name, bond_length)
+    #atom_info = f"H 0 0 0; H 0 0 {bond_length}" Set manually
     driver = PySCFDriver(atom=atom_info,
-                         charge=CHARGE,
                          unit=DistanceUnit.BOHR,
                          basis="sto3g")
     problem = driver.run()
@@ -167,9 +156,15 @@ def quantum_krylov_diagonalization():
 
     H_K = np.zeros((M, M), dtype=complex)
     S_K = np.zeros((M, M), dtype=complex)
-    estimator = Estimator()
 
-    observe_ancilla = Pauli('Z' + 'I' * num_qubits)
+    estimator = StatevectorEstimator()
+    # estimator = Estimator()
+
+    n_tot = num_qubits + 1  # ancilla + system
+
+    observe_ancilla_Z = SparsePauliOp.from_sparse_list([("Z", [0], 1.0)], num_qubits=n_tot)
+    observe_ancilla_Y = SparsePauliOp.from_sparse_list([("Y", [0], 1.0)], num_qubits=n_tot)
+
     print(f"\n--- 5. Building Scalable Krylov Subspace (Dimension M={M}) ---")
 
     for i in range(M):
@@ -183,13 +178,17 @@ def quantum_krylov_diagonalization():
 
             observable_I = Pauli('I' * num_qubits)
 
-            qc_S_real = haddy_test(num_qubits, circuit_i, circuit_j, observable_I, False)
-            qc_S_imag = haddy_test(num_qubits, circuit_i, circuit_j, observable_I, True)
+            qc_S = haddy_test(num_qubits, circuit_i, circuit_j, observable_I)
+            qc_S_t = transpile(qc_S, optimization_level=0)
+            res = estimator.run([
+                (qc_S_t, observe_ancilla_Z),
+                (qc_S_t, observe_ancilla_Y),
+            ]).result()
 
-            primitive_result = estimator.run([qc_S_real, qc_S_imag], [observe_ancilla, observe_ancilla]).result()
+            # res = estimator.run([qc_S, qc_S], [observe_ancilla_Z, observe_ancilla_Y]).result()
 
-            S_ij_real = primitive_result.values[0]
-            S_ij_imag = primitive_result.values[1]
+            S_ij_real = ev(res, 0)
+            S_ij_imag = ev(res, 1)
             S_ij = S_ij_real + 1j * S_ij_imag
             print(f"S element {i},{j}: {S_ij}")
 
@@ -202,13 +201,15 @@ def quantum_krylov_diagonalization():
             H_ij_sum = 0.0 + 0j
 
             for h_p, P_p in zip(pauli_coeffs, pauli_terms):
-                qc_H_real = haddy_test(num_qubits, circuit_i, circuit_j, P_p, ancilla_phase=False)
-                qc_H_imag = haddy_test(num_qubits, circuit_i, circuit_j, P_p, ancilla_phase=True)
-                results_H = estimator.run([qc_H_real, qc_H_imag], [observe_ancilla, observe_ancilla]).result()
+                qc_H = haddy_test(num_qubits, circuit_i, circuit_j, P_p)
+                qc_H_t = transpile(qc_H, optimization_level=0)
 
-                P_p_overlap_real = results_H.values[0]
-                P_p_overlap_imag = results_H.values[1]
-
+                resH = estimator.run([
+                    (qc_H_t, observe_ancilla_Z),
+                    (qc_H_t, observe_ancilla_Y),
+                ]).result()
+                P_p_overlap_real = ev(resH, 0)
+                P_p_overlap_imag = ev(resH, 1)
                 P_p_overlap = P_p_overlap_real + 1j * P_p_overlap_imag
                 H_ij_sum += h_p * P_p_overlap
                 print(f"Pauli sum: {P_p_overlap} Pauli: {P_p} weight: {h_p}")
@@ -229,12 +230,12 @@ def quantum_krylov_diagonalization():
     print(np.round(S_K.imag, 6))
 
     # The Generalized Eigenvalue Problem is H_K * c = E * S_K * c
-    eigenvalues = la.eig(H_K, S_K, right=False)
+    eigs = la.eig(H_K, S_K, right=False)
 
-    ground_electronic_energy = np.min(eigenvalues)
-
-    print(f"\nCalculated Krylov Subspace Eigenvalues: {eigenvalues}")
-    print(f"QKD Electronic Ground Energy (min eigenvalue): {ground_electronic_energy:.6f} Hartree")
+    # pick the minimum real part (and you may optionally filter small imaginary noise)
+    ground_electronic_energy = np.min(eigs.real)
+    print(f"\nCalculated Krylov Subspace Eigenvalues: {eigs}")
+    print(f"QKD Electronic Ground Energy (min real part): {ground_electronic_energy:.6f} Hartree")
 
     # Final result (Total Energy)
     total_ground_energy = ground_electronic_energy + nuclear_repulsion_energy
